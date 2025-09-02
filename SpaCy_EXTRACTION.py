@@ -408,7 +408,8 @@ def process_pdf_stem(stem_dir: Path) -> None:
             "sumario_file": "sumario_raw.txt",
             "sumario_items_file": "sumario_items.json",
             "items": [],
-            "unmatched": unmatched
+            "unmatched": unmatched,
+            "warnings": []
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         return
 
@@ -435,10 +436,11 @@ def process_pdf_stem(stem_dir: Path) -> None:
         "sumario_file": "sumario_raw.txt",
         "sumario_items_file": "sumario_items.json",
         "items": [],
-        "unmatched": unmatched
+        "unmatched": unmatched,
+        "warnings": []       # NEW: QA warnings
     }
 
-    # Prep a quick function to get ORG for a given anchor (for metadata & optional prepend)
+    # Helper to get ORG metadata (not used for slicing)
     def org_for_anchor(anchor: int):
         name, org_s, org_e = find_org_for_line(
             org_positions_all, anchor,
@@ -452,28 +454,47 @@ def process_pdf_stem(stem_dir: Path) -> None:
         # body slice: ACT -> next ACT (or EOF)
         chunk_lines = lines[start:end]
 
-        # ORG metadata (not used for slicing)
+        # ORG metadata
         body_org_name, _org_s, _org_e = org_for_anchor(start)
 
-        # Prepend ORG heading if the first line isn't already it (purely cosmetic/labeling)
-        doc_lines = []
-        if not chunk_lines or norm_ws(chunk_lines[0]) != norm_ws(body_org_name):
-            doc_lines.append(body_org_name)
-            doc_lines.append("")
-        doc_lines.extend(chunk_lines)
+        # -------- HEADER-FIRST ENFORCEMENT (prevents "stolen" lines) --------
+        anchor_header = lines[start].strip()
+        content = chunk_lines
+
+        # Skip forward until we hit the exact anchored header line
+        k = 0
+        while k < len(content) and content[k].strip() != anchor_header:
+            k += 1
+        if k < len(content):
+            content = content[k:]
+        else:
+            # Fallback (shouldn’t happen): ensure we at least write the header
+            content = [anchor_header]
+        # --------------------------------------------------------------------
+
+        doc_lines = content
 
         fname = make_doc_filename(it["kind_full"], it["number"])
         (docs_dir / fname).write_text("\n".join(doc_lines), encoding="utf-8")
 
+        # QA sanity check
+        first_line = doc_lines[0].strip() if doc_lines else ""
+        if first_line != anchor_header:
+            index["warnings"].append({
+                "file": fname,
+                "expected_header": anchor_header,
+                "got": first_line
+            })
+
         if DEBUG:
             print(f"-> wrote {fname}  lines [{start}:{end})")
 
-        # Simplified index item:
+        # Simplified index item
         index["items"].append({
             "section_sumario": it.get("section"),
             "section_body": body_org_name,
-            "kind": it["kind_base"].lower(),                 # just 'despacho' etc.
-            "act_raw": lines[start].strip(),                 # exact header from BODY
+            "kind": it["kind_base"].lower(),        # just 'despacho', 'aviso', ...
+            "act_raw": lines[start].strip(),        # exact header from BODY
             "doc_file": f"docs/{fname}",
             "body_line_range": [start, end - 1],
             "sumario_line_range": it.get("sumario_line_range"),
