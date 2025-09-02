@@ -11,7 +11,7 @@ OUTPUT_ROOT = Path("output_EXTRACTED_DOCUMENTS")
 DEBUG = True  # set to False to silence debug prints
 
 # ---------------------------
-# spaCy model + matchers
+# spaCy model + matchers (ORG only)
 # ---------------------------
 KIND_WORDS = [
     "despacho", "aviso", "declaração", "declaracao", "edital",
@@ -36,10 +36,8 @@ def load_pt_model():
 
 NLP = load_pt_model()
 
-def build_matchers(nlp) -> Tuple[Matcher, Matcher]:
+def build_org_matcher(nlp) -> Matcher:
     org_matcher = Matcher(nlp.vocab)
-    des_matcher = Matcher(nlp.vocab)
-
     # ORG: sequences of uppercase tokens; allow hyphenated too
     org_patterns = [
         [{"IS_UPPER": True, "OP": "+"}],
@@ -47,41 +45,9 @@ def build_matchers(nlp) -> Tuple[Matcher, Matcher]:
     ]
     for p in org_patterns:
         org_matcher.add("ORG_HEAD", [p])
+    return org_matcher
 
-    # DES/ACT: line-based; optional words and optional "n.º"/variants; then number and optional "/ year"
-    des_patterns = [
-        [
-            {"LOWER": {"IN": KIND_WORDS}},
-            {"LOWER": {"IN": [
-                "conjunto", "normativo", "regulamentar",
-                "conjunta", "normativa", "regulamentar",
-                "conjunto", "de", "da", "do", "retificação", "retificacao",
-                "societário", "societario", "extraordinário", "extraordinario"
-            ]}, "OP": "*"},
-            {"TEXT": {"IN": list(N_TOKENS)} , "OP": "?"},
-            {"LIKE_NUM": True},
-            {"TEXT": "/", "OP": "?"},
-            {"LIKE_NUM": True, "OP": "?"},
-        ],
-        [
-            {"LOWER": {"IN": KIND_WORDS}},
-            {"LOWER": {"IN": [
-                "conjunto", "normativo", "regulamentar",
-                "conjunta", "normativa",
-                "de", "da", "do", "retificação", "retificacao",
-                "societário", "societario", "extraordinário", "extraordinario"
-            ]}, "OP": "*"},
-            {"LIKE_NUM": True},
-            {"TEXT": "/", "OP": "?"},
-            {"LIKE_NUM": True, "OP": "?"},
-        ],
-    ]
-    for p in des_patterns:
-        des_matcher.add("DES_ACT", [p])
-
-    return org_matcher, des_matcher
-
-ORG_MATCHER, DES_MATCHER = build_matchers(NLP)
+ORG_MATCHER = build_org_matcher(NLP)
 
 # ---------------------------
 # Helpers (no regex; original text preserved)
@@ -116,6 +82,7 @@ def consume_org_block(lines: List[str], i: int) -> Tuple[str, int]:
         if is_org_line(nxt):
             parts.append(nxt.strip())
             j += 1
+            # usually ORG wraps to just the next line; cap at 3 lines just in case
             if len(parts) >= 3:
                 break
             continue
@@ -125,26 +92,29 @@ def consume_org_block(lines: List[str], i: int) -> Tuple[str, int]:
 def digits_only(s: str) -> str:
     return "".join(ch for ch in s if ch.isdigit())
 
+# ---------------------------
+# ACT parsing & detection (no matcher gate; header-only rule)
+# ---------------------------
 def parse_act_tokens(doc):
     """
     Extract (kind_base, kind_modifier, number, year, kind_full, last_idx_used) from ONE LINE doc.
-    last_idx_used = index of the last token that is part of the header (number/year token).
+    last_idx_used = index of the last token that is part of the header (usually the year or '215/2025' token).
+    Kind must appear at the start (only punctuation allowed before it).
     """
     kind_base = None
     number = None
     year = None
     last_idx_used = -1
 
-    def digits_only(s: str) -> str:
-        return "".join(ch for ch in s if ch.isdigit())
-
-    # find base kind
+    # find base kind at the start (allow only punctuation before it)
     kind_idx = None
     for i, tok in enumerate(doc):
         if tok.text.lower() in KIND_SET:
-            kind_base = tok.text
-            kind_idx = i
-            last_idx_used = i
+            # ensure all tokens before are punctuation (no letters/digits)
+            if all((t.is_punct or (not t.text.strip())) for t in doc[:i]):
+                kind_base = tok.text
+                kind_idx = i
+                last_idx_used = i
             break
     if kind_idx is None:
         return None
@@ -166,7 +136,7 @@ def parse_act_tokens(doc):
             last_idx_used = i
         i += 1
 
-    # after kind/modifier scan, find number/year
+    # find number/year (robust to '215/2025' as a single token)
     j = kind_idx + 1
     while j < len(doc) and number is None:
         tok = doc[j]
@@ -174,29 +144,27 @@ def parse_act_tokens(doc):
         if any(ch.isdigit() for ch in txt):
             if "/" in txt:
                 left, _, right = txt.partition("/")
-                num = digits_only(left)
+                number = digits_only(left) or number
                 y = digits_only(right)
-                if num:
-                    number = num
                 if y:
                     year = y
+                last_idx_used = max(last_idx_used, j)
             else:
-                number = digits_only(txt)
-                # look ahead for / year
+                number = digits_only(txt) or number
+                # try '/ year'
                 if j + 2 < len(doc) and doc[j+1].text == "/" and any(ch.isdigit() for ch in doc[j+2].text):
                     year = digits_only(doc[j+2].text)
-                    last_idx_used = j + 2
+                    last_idx_used = max(last_idx_used, j + 2)
                 else:
-                    # otherwise, next numeric token
+                    # otherwise, next numeric token as year
                     k = j + 1
                     while k < len(doc):
                         if any(ch.isdigit() for ch in doc[k].text):
                             year = digits_only(doc[k].text)
-                            last_idx_used = k
+                            last_idx_used = max(last_idx_used, k)
                             break
                         k += 1
-            if last_idx_used < j:
-                last_idx_used = j
+            last_idx_used = max(last_idx_used, j)
         j += 1
 
     if not (kind_base and number and year):
@@ -206,18 +174,17 @@ def parse_act_tokens(doc):
     kind_full = (kind_base + (" " + kind_modifier if kind_modifier else "")).strip()
     return kind_base, kind_modifier, number, year, kind_full, last_idx_used
 
-
 def extract_act_from_line(text: str):
     """
     Return (kind_base, kind_modifier, number, year, kind_full) ONLY if the line is a pure header:
-    i.e., no alphabetic or numeric tokens AFTER the header (we allow trailing punctuation only).
+    - kind at the start (no letters/digits before it, punctuation allowed),
+    - number/year present,
+    - and no alphabetic OR numeric tokens after the header (punctuation allowed).
     """
     t = text.strip()
     if not t or t == "Sumário":
         return None
     doc = NLP(t)
-    if len(DES_MATCHER(doc)) == 0:
-        return None
 
     parsed = parse_act_tokens(doc)
     if not parsed:
@@ -227,13 +194,12 @@ def extract_act_from_line(text: str):
     # Must be alone: after the last header token, there should be no letters/digits
     for tok in doc[last_idx + 1:]:
         if tok.is_alpha or any(ch.isdigit() for ch in tok.text):
-            return None  # has trailing text → not a pure header line
+            return None
 
     return (kind_base, kind_modifier, number, year, kind_full)
 
-
 # ---------------------------
-# Sumário detection (as specified, with multi-line ORG)
+# Sumário detection (with multi-line ORG)
 # ---------------------------
 def find_sumario_range(lines: List[str]) -> Tuple[Optional[int], Optional[int], Optional[str]]:
     # 1) first line exactly "Sumário"
@@ -343,7 +309,7 @@ def parse_sumario_items(sum_lines: List[str]) -> List[Dict]:
 # Body anchoring (line-by-line with spaCy token parsing)
 # ---------------------------
 def extract_kind_num_year_from_line(text: str) -> Optional[Tuple[str, str, str, str, str]]:
-    """Parse a BODY line. If it is the ACT header line, return (kind_base, kind_modifier, number, year, kind_full)."""
+    """Parse a BODY line. If it is the ACT header line, return tuple; else None."""
     return extract_act_from_line(text)
 
 def find_act_line_in_section(lines: List[str], start_idx: int, end_idx: int,
