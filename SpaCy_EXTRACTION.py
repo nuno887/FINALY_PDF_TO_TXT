@@ -20,6 +20,12 @@ KIND_WORDS = [
 ]
 KIND_SET = set(KIND_WORDS)
 
+# words we DO NOT treat as modifiers (common connectors/prepositions)
+NON_MODIFIER_TOKENS = {
+    "de", "da", "do", "das", "dos", "e", "em", "para", "no", "na", "nos", "nas"
+}
+N_TOKENS = {"n.º", "nº", "n.o", "n.°", "n°", "n."}
+
 def load_pt_model():
     for name in ("pt_core_news_lg", "pt_core_news_md", "pt_core_news_sm"):
         try:
@@ -46,15 +52,25 @@ def build_matchers(nlp) -> Tuple[Matcher, Matcher]:
     des_patterns = [
         [
             {"LOWER": {"IN": KIND_WORDS}},
-            {"LOWER": {"IN": ["conjunto", "de", "da", "do", "retificação", "retificacao", "societário", "societario"]}, "OP": "*"},
-            {"TEXT": {"IN": ["n.º", "nº", "n.o", "n.°"]}, "OP": "?"},
+            {"LOWER": {"IN": [
+                "conjunto", "normativo", "regulamentar",
+                "conjunta", "normativa", "regulamentar",
+                "conjunto", "de", "da", "do", "retificação", "retificacao",
+                "societário", "societario", "extraordinário", "extraordinario"
+            ]}, "OP": "*"},
+            {"TEXT": {"IN": list(N_TOKENS)} , "OP": "?"},
             {"LIKE_NUM": True},
             {"TEXT": "/", "OP": "?"},
             {"LIKE_NUM": True, "OP": "?"},
         ],
         [
             {"LOWER": {"IN": KIND_WORDS}},
-            {"LOWER": {"IN": ["conjunto", "de", "da", "do", "retificação", "retificacao", "societário", "societario"]}, "OP": "*"},
+            {"LOWER": {"IN": [
+                "conjunto", "normativo", "regulamentar",
+                "conjunta", "normativa",
+                "de", "da", "do", "retificação", "retificacao",
+                "societário", "societario", "extraordinário", "extraordinario"
+            ]}, "OP": "*"},
             {"LIKE_NUM": True},
             {"TEXT": "/", "OP": "?"},
             {"LIKE_NUM": True, "OP": "?"},
@@ -78,74 +94,146 @@ def is_org_line(text: str) -> bool:
     doc = NLP(t)
     return len(ORG_MATCHER(doc)) > 0
 
-def parse_act_tokens(doc) -> Optional[Tuple[str, str, str]]:
+def norm_ws(s: str) -> str:
+    """Normalize for matching only: collapse spaces and lowercase."""
+    return " ".join(s.replace("\u00A0", " ").split()).lower()
+
+def consume_org_block(lines: List[str], i: int) -> Tuple[str, int]:
     """
-    Extract (kind, number, year) from a spaCy Doc representing ONE LINE.
-    Handles:
-      - 'Despacho n.º 215/2025'
-      - 'Despacho 215/2025'
-      - token '215/2025' as a single token (split by '/')
+    Given index i at the start of an ORG line, consume subsequent uppercase/ORG-like continuation
+    lines (typically the next line for wrapped headings) and return (combined_org_text, next_index).
     """
-    kind = None
+    parts = [lines[i].strip()]
+    j = i + 1
+    while j < len(lines):
+        nxt = lines[j]
+        if not nxt.strip():
+            break
+        # stop if the next line looks like an ACT header
+        if extract_act_from_line(nxt):
+            break
+        # continue if the next line is also an ORG-like uppercase line
+        if is_org_line(nxt):
+            parts.append(nxt.strip())
+            j += 1
+            if len(parts) >= 3:
+                break
+            continue
+        break
+    return " ".join(parts), j
+
+def digits_only(s: str) -> str:
+    return "".join(ch for ch in s if ch.isdigit())
+
+def parse_act_tokens(doc):
+    """
+    Extract (kind_base, kind_modifier, number, year, kind_full, last_idx_used) from ONE LINE doc.
+    last_idx_used = index of the last token that is part of the header (number/year token).
+    """
+    kind_base = None
     number = None
     year = None
+    last_idx_used = -1
 
     def digits_only(s: str) -> str:
         return "".join(ch for ch in s if ch.isdigit())
 
-    i = 0
+    # find base kind
+    kind_idx = None
+    for i, tok in enumerate(doc):
+        if tok.text.lower() in KIND_SET:
+            kind_base = tok.text
+            kind_idx = i
+            last_idx_used = i
+            break
+    if kind_idx is None:
+        return None
+
+    # collect modifier tokens between base kind and the number / 'n.º'
+    modifier_tokens: List[str] = []
+    i = kind_idx + 1
     while i < len(doc):
-        tok = doc[i]
-        low = tok.text.lower()
-        if kind is None and low in KIND_SET:
-            kind = tok.text  # keep original case/accents as seen on this line
-
-        # number/year detection (robust to a single token like "215/2025")
-        if number is None:
-            txt = tok.text
-            if any(ch.isdigit() for ch in txt):
-                if "/" in txt:
-                    left, _, right = txt.partition("/")
-                    num = digits_only(left)
-                    yr = digits_only(right)
-                    if num:
-                        number = num
-                    if yr:
-                        year = yr
-                else:
-                    number = digits_only(txt) or number
-
-                # try to fetch year nearby if not set yet
-                if year is None:
-                    # if next tokens contain '/' and a numeric, capture year
-                    if i + 2 < len(doc) and doc[i+1].text == "/" and any(ch.isdigit() for ch in doc[i+2].text):
-                        year = digits_only(doc[i+2].text)
-                    else:
-                        # otherwise, take the next numeric token as year
-                        j = i + 1
-                        while j < len(doc):
-                            if any(ch.isdigit() for ch in doc[j].text):
-                                year = digits_only(doc[j].text)
-                                break
-                            j += 1
+        t = doc[i]
+        txt = t.text
+        low = txt.lower()
+        if txt in N_TOKENS:
+            last_idx_used = i
+            break
+        if any(ch.isdigit() for ch in txt) or txt == "/":
+            break
+        if t.is_alpha and low not in NON_MODIFIER_TOKENS:
+            modifier_tokens.append(txt)
+            last_idx_used = i
         i += 1
 
-    if kind and number and year:
-        return kind, number, year
-    return None
+    # after kind/modifier scan, find number/year
+    j = kind_idx + 1
+    while j < len(doc) and number is None:
+        tok = doc[j]
+        txt = tok.text
+        if any(ch.isdigit() for ch in txt):
+            if "/" in txt:
+                left, _, right = txt.partition("/")
+                num = digits_only(left)
+                y = digits_only(right)
+                if num:
+                    number = num
+                if y:
+                    year = y
+            else:
+                number = digits_only(txt)
+                # look ahead for / year
+                if j + 2 < len(doc) and doc[j+1].text == "/" and any(ch.isdigit() for ch in doc[j+2].text):
+                    year = digits_only(doc[j+2].text)
+                    last_idx_used = j + 2
+                else:
+                    # otherwise, next numeric token
+                    k = j + 1
+                    while k < len(doc):
+                        if any(ch.isdigit() for ch in doc[k].text):
+                            year = digits_only(doc[k].text)
+                            last_idx_used = k
+                            break
+                        k += 1
+            if last_idx_used < j:
+                last_idx_used = j
+        j += 1
 
-def extract_act_from_line(text: str) -> Optional[Tuple[str, str, str]]:
-    """Return (kind, number, year) if the line is an ACT header; else None."""
+    if not (kind_base and number and year):
+        return None
+
+    kind_modifier = " ".join(modifier_tokens).strip()
+    kind_full = (kind_base + (" " + kind_modifier if kind_modifier else "")).strip()
+    return kind_base, kind_modifier, number, year, kind_full, last_idx_used
+
+
+def extract_act_from_line(text: str):
+    """
+    Return (kind_base, kind_modifier, number, year, kind_full) ONLY if the line is a pure header:
+    i.e., no alphabetic or numeric tokens AFTER the header (we allow trailing punctuation only).
+    """
     t = text.strip()
     if not t or t == "Sumário":
         return None
     doc = NLP(t)
     if len(DES_MATCHER(doc)) == 0:
         return None
-    return parse_act_tokens(doc)
+
+    parsed = parse_act_tokens(doc)
+    if not parsed:
+        return None
+    kind_base, kind_modifier, number, year, kind_full, last_idx = parsed
+
+    # Must be alone: after the last header token, there should be no letters/digits
+    for tok in doc[last_idx + 1:]:
+        if tok.is_alpha or any(ch.isdigit() for ch in tok.text):
+            return None  # has trailing text → not a pure header line
+
+    return (kind_base, kind_modifier, number, year, kind_full)
+
 
 # ---------------------------
-# Sumário detection (as specified)
+# Sumário detection (as specified, with multi-line ORG)
 # ---------------------------
 def find_sumario_range(lines: List[str]) -> Tuple[Optional[int], Optional[int], Optional[str]]:
     # 1) first line exactly "Sumário"
@@ -157,37 +245,50 @@ def find_sumario_range(lines: List[str]) -> Tuple[Optional[int], Optional[int], 
     if start is None:
         return None, None, None
 
-    # 2) first ORG after "Sumário" (spaCy matcher)
+    # 2) first ORG block after "Sumário"
     first_org = None
     first_org_idx = None
-    for j in range(start + 1, len(lines)):
+    j = start + 1
+    while j < len(lines):
         if is_org_line(lines[j]):
-            first_org = lines[j].strip()
+            first_org, next_after_org = consume_org_block(lines, j)
             first_org_idx = j
             break
+        j += 1
     if first_org is None:
         end = min(len(lines), start + 120)  # fallback snapshot
         return start, end, None
 
-    # 3) Sumário ends immediately before the NEXT occurrence of that same ORG line
+    # 3) Sumário ends immediately before the NEXT occurrence of that same ORG (1–2 line window match)
+    target = norm_ws(first_org)
     end = None
-    for k in range(first_org_idx + 1, len(lines)):
-        if lines[k].strip() == first_org:
+    k = next_after_org
+    while k < len(lines):
+        one = norm_ws(lines[k].strip())
+        if one == target:
             end = k
             break
+        if k + 1 < len(lines):
+            two = norm_ws(lines[k].strip() + " " + lines[k+1].strip())
+            if two == target:
+                end = k
+                break
+        k += 1
     if end is None:
-        # Fallback: next ORG-like line after first_org
-        for k in range(first_org_idx + 1, len(lines)):
+        # Fallback: next ORG-like line after j
+        k = next_after_org
+        while k < len(lines):
             if is_org_line(lines[k]):
                 end = k
                 break
+            k += 1
     if end is None:
         end = len(lines)
 
     return start, end, first_org
 
 # ---------------------------
-# Sumário parsing (multiple ORGs, multiple ACTs) — line-by-line
+# Sumário parsing (multiple ORGs, multiple ACTs) — line-by-line, with multi-line ORG combine
 # ---------------------------
 def parse_sumario_items(sum_lines: List[str]) -> List[Dict]:
     items = []
@@ -197,13 +298,14 @@ def parse_sumario_items(sum_lines: List[str]) -> List[Dict]:
         line = sum_lines[i]
 
         if is_org_line(line):
-            current_org = line.strip()
-            i += 1
+            combined_org, j = consume_org_block(sum_lines, i)
+            current_org = combined_org
+            i = j
             continue
 
         parsed = extract_act_from_line(line)
         if parsed:
-            kind, number, year = parsed
+            kind_base, kind_modifier, number, year, kind_full = parsed
             act_text = line.strip()  # keep for metadata
 
             # Optional short lead: next 1–3 non-empty lines, stopping at blank/next ORG/next ACT
@@ -222,7 +324,9 @@ def parse_sumario_items(sum_lines: List[str]) -> List[Dict]:
 
             items.append({
                 "section": current_org,
-                "kind": kind,
+                "kind_base": kind_base,
+                "kind_modifier": kind_modifier,
+                "kind_full": kind_full,
                 "number": number,
                 "year": year,
                 "act_text": act_text,
@@ -238,26 +342,47 @@ def parse_sumario_items(sum_lines: List[str]) -> List[Dict]:
 # ---------------------------
 # Body anchoring (line-by-line with spaCy token parsing)
 # ---------------------------
-def extract_kind_num_year_from_line(text: str) -> Optional[Tuple[str, str, str]]:
-    """Parse a BODY line. If it is the ACT header line, return (kind_lower, number, year)."""
-    parsed = extract_act_from_line(text)
-    if not parsed:
-        return None
-    kind, number, year = parsed
-    return (kind.lower(), number, year)
+def extract_kind_num_year_from_line(text: str) -> Optional[Tuple[str, str, str, str, str]]:
+    """Parse a BODY line. If it is the ACT header line, return (kind_base, kind_modifier, number, year, kind_full)."""
+    return extract_act_from_line(text)
 
 def find_act_line_in_section(lines: List[str], start_idx: int, end_idx: int,
-                             kind: str, number: str, year: str) -> Optional[int]:
-    target_kind = kind.lower()
-    target_num = number
-    target_year = year
+                             kind_base: str, kind_modifier: str, number: str, year: str) -> Optional[int]:
+    tgt_base = kind_base.lower()
+    tgt_full = (kind_base + (" " + kind_modifier if kind_modifier else "")).strip().lower()
     for i in range(start_idx, end_idx):
         parsed = extract_kind_num_year_from_line(lines[i])
-        if parsed:
-            pk, pn, py = parsed
-            if pk == target_kind and pn == target_num and py == target_year:
+        if not parsed:
+            continue
+        pk_base, pk_mod, pn, py, pk_full = parsed
+        if pn == number and py == year:
+            # Accept if base kind matches (always), or full kind matches (when present)
+            if pk_base.lower() == tgt_base or pk_full.lower() == tgt_full:
                 return i
     return None
+
+# ---------------------------
+# ORG positions in body (1–2 line windows)
+# ---------------------------
+def find_org_positions_in_body(lines: List[str], start_idx: int, orgs: List[str]) -> List[Tuple[int, str]]:
+    positions: List[Tuple[int, str]] = []
+    norm_map = {norm_ws(o): o for o in orgs}
+    norms = set(norm_map.keys())
+    i = start_idx
+    L = len(lines)
+    while i < L:
+        l1 = norm_ws(lines[i].strip())
+        matched = None
+        if l1 in norms:
+            matched = norm_map[l1]
+        elif i + 1 < L:
+            l12 = norm_ws(lines[i].strip() + " " + lines[i+1].strip())
+            if l12 in norms:
+                matched = norm_map[l12]
+        if matched:
+            positions.append((i, matched))
+        i += 1
+    return positions
 
 # ---------------------------
 # Per PDF-stem processing
@@ -286,7 +411,7 @@ def process_pdf_stem(stem_dir: Path) -> None:
     items = parse_sumario_items(sumario_raw)
     (out_dir / "sumario_items.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # ORGs in sumário (unique, in order)
+    # ORGs in sumário (unique, in order; canonical combined text)
     orgs_unique: List[str] = []
     for it in items:
         org = it.get("section")
@@ -302,16 +427,13 @@ def process_pdf_stem(stem_dir: Path) -> None:
             print("  -", o)
         print("ACTs (from Sumário, in order):")
         for idx, it in enumerate(items, 1):
-            print(f"  {idx:02d}. [{it.get('section')}] {it['kind']} {it['number']}/{it['year']} | act_line='{it.get('act_text','')}'")
+            print(f"  {idx:02d}. [{it.get('section')}] {it['kind_full']} {it['number']}/{it['year']} | act_line='{it.get('act_text','')}'")
 
     # Body starts at sum_end (or 0 if no Sumário)
     body_start = sum_end if sum_end is not None else 0
 
-    # Find each ORG position in the body (exact equality to known ORG lines)
-    org_positions: List[Tuple[int, Optional[str]]] = []
-    for i in range(body_start, len(lines)):
-        if lines[i].strip() in orgs_unique:
-            org_positions.append((i, lines[i].strip()))
+    # Find each ORG position in the body with multi-line aware matching
+    org_positions: List[Tuple[int, Optional[str]]] = find_org_positions_in_body(lines, body_start, orgs_unique)
     org_positions.append((len(lines), None))  # sentinel end
 
     if DEBUG:
@@ -334,10 +456,10 @@ def process_pdf_stem(stem_dir: Path) -> None:
         org = it.get("section") or ""
         items_by_org.setdefault(org, []).append(it)
 
-    # Filename generator (use original kind text; make filesystem-safe)
+    # Filename generator (use kind_full; make filesystem-safe)
     used_names = set()
-    def make_doc_filename(kind: str, number: str) -> str:
-        base = f"{kind}-{number}.txt"
+    def make_doc_filename(kind_full: str, number: str) -> str:
+        base = f"{kind_full}-{number}.txt"
         safe = "".join(ch for ch in base if ch not in '\\/:*?"<>|')
         name = safe
         suffix = ord('a')
@@ -367,8 +489,11 @@ def process_pdf_stem(stem_dir: Path) -> None:
         search_start = org_start + 1  # skip the ORG header line
         for it in expected_items:
             if DEBUG:
-                print(f"   searching: {it['kind']} {it['number']}/{it['year']}")
-            pos = find_act_line_in_section(lines, search_start, org_end, it["kind"], it["number"], it["year"])
+                print(f"   searching: {it['kind_full']} {it['number']}/{it['year']}")
+            pos = find_act_line_in_section(
+                lines, search_start, org_end,
+                it["kind_base"], it["kind_modifier"], it["number"], it["year"]
+            )
             if DEBUG:
                 if pos is not None:
                     print(f"     FOUND at line {pos}: {lines[pos].rstrip()!r}")
@@ -379,7 +504,7 @@ def process_pdf_stem(stem_dir: Path) -> None:
             else:
                 index["unmatched"].append({
                     "section": it.get("section"),
-                    "kind": it["kind"],
+                    "kind_full": it["kind_full"],
                     "number": it["number"],
                     "year": it["year"],
                     "title": it.get("title", ""),
@@ -392,19 +517,19 @@ def process_pdf_stem(stem_dir: Path) -> None:
         act_starts.sort(key=lambda x: x[0])
         boundaries = [p for p, _ in act_starts] + [org_end]
 
-        # Slice each doc by line ranges; prepend ORG label
+        # Slice each doc by line ranges; prepend ORG label (canonical combined text)
         for aidx, (start_pos, it) in enumerate(act_starts):
             start = start_pos
             end = boundaries[aidx + 1]
             chunk_lines = lines[start:end]
 
             doc_lines = []
-            if not chunk_lines or chunk_lines[0].strip() != org_name.strip():
-                doc_lines.append(org_name.strip())
+            if not chunk_lines or norm_ws(chunk_lines[0]) != norm_ws(org_name):
+                doc_lines.append(org_name)
                 doc_lines.append("")
             doc_lines.extend(chunk_lines)
 
-            fname = make_doc_filename(it["kind"], it["number"])
+            fname = make_doc_filename(it["kind_full"], it["number"])
             (docs_dir / fname).write_text("\n".join(doc_lines), encoding="utf-8")
 
             if DEBUG:
@@ -412,7 +537,9 @@ def process_pdf_stem(stem_dir: Path) -> None:
 
             index["items"].append({
                 "section": it.get("section"),
-                "kind": it["kind"],
+                "kind_base": it["kind_base"],
+                "kind_modifier": it["kind_modifier"],
+                "kind_full": it["kind_full"],
                 "number": it["number"],
                 "year": it["year"],
                 "title": it.get("title", ""),
@@ -424,7 +551,7 @@ def process_pdf_stem(stem_dir: Path) -> None:
     if DEBUG and index["unmatched"]:
         print(f"\nUNMATCHED ({len(index['unmatched'])}):")
         for u in index["unmatched"]:
-            print(f"  - [{u.get('section')}] {u['kind']} {u['number']}/{u['year']}  reason={u['reason']}")
+            print(f"  - [{u.get('section')}] {u['kind_full']} {u['number']}/{u['year']}  reason={u['reason']}")
 
     (out_dir / "index.json").write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
 
