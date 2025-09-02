@@ -1,0 +1,5 @@
+spacy>=3.7
+pymupdf>=1.24
+pdfplumber>=0.11
+pytesseract>=0.3.10
+ocrmypdf>=16.0
